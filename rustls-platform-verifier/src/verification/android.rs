@@ -1,17 +1,23 @@
+use core::hash::Hasher;
 use jni::{
     jni_sig, jni_str,
     objects::{JByteArray, JObject, JObjectArray, JString, JValue},
     signature::MethodSignature,
     Env,
 };
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
-use rustls::pki_types;
-use rustls::Error::InvalidCertificate;
-use rustls::{
-    CertificateError, DigitallySignedStruct, Error as TlsError, OtherError, SignatureScheme,
+use rustls::client::danger::{
+    HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
+    SignatureVerificationInput,
 };
-use std::sync::Arc;
+use rustls::crypto::{
+    verify_tls12_signature, verify_tls13_signature, CertificateIdentity, CryptoProvider, Identity,
+    SignatureScheme,
+};
+use rustls::error::{CertificateError, OtherError};
+use rustls::pki_types;
+use rustls::Error as TlsError;
+use rustls::Error::InvalidCertificate;
+use std::{iter, sync::Arc};
 
 use super::{log_server_cert, ALLOWED_EKUS};
 use crate::android::{with_context, CachedClass};
@@ -89,21 +95,18 @@ impl Verifier {
 
     fn verify_certificate(
         &self,
-        end_entity: &pki_types::CertificateDer<'_>,
-        intermediates: &[pki_types::CertificateDer<'_>],
-        server_name: &pki_types::ServerName<'_>,
-        ocsp_response: Option<&[u8]>,
-        now: pki_types::UnixTime,
+        certificates: &CertificateIdentity<'_>,
+        identity: &ServerIdentity<'_>,
     ) -> Result<(), TlsError> {
-        let certificate_chain = std::iter::once(end_entity)
-            .chain(intermediates)
+        let certificate_chain = iter::once(&certificates.end_entity)
+            .chain(&certificates.intermediates)
             .map(|cert| cert.as_ref())
             .enumerate();
 
         // Convert the unix timestamp into milliseconds, expressed as
         // an i64 to later be converted into a Java Long used for a Date
         // constructor.
-        let now: i64 = (now.as_secs() * 1000)
+        let now: i64 = (identity.now.as_secs() * 1000)
             .try_into()
             .map_err(|_| TlsError::FailedToGetCurrentTime)?;
 
@@ -113,7 +116,7 @@ impl Verifier {
             let cert_list = {
                 let array = JObjectArray::<JByteArray>::new(
                     cx.env,
-                    intermediates.len() + 1,
+                    certificates.intermediates.len() + 1,
                     &JByteArray::null(),
                 )?;
 
@@ -139,9 +142,10 @@ impl Verifier {
                 array
             };
 
-            let ocsp_response = match ocsp_response {
-                Some(b) => cx.env.byte_array_from_slice(b)?,
-                None => JByteArray::null(),
+            let ocsp_response = if identity.ocsp_response.is_empty() {
+                JByteArray::null()
+            } else {
+                cx.env.byte_array_from_slice(identity.ocsp_response)?
             };
 
             #[cfg(any(test, feature = "ffi-testing"))]
@@ -172,7 +176,7 @@ impl Verifier {
                 ) -> org.rustls.platformverifier.VerificationResult
             );
 
-            let server_name = cx.env.new_string(server_name.to_str())?;
+            let server_name = cx.env.new_string(identity.server_name.to_str())?;
             let auth_type = cx.env.new_string(AUTH_TYPE)?;
 
             let result = cx
@@ -206,8 +210,8 @@ impl Verifier {
                     VerifierStatus::Ok => {
                         // If everything else was OK, check the hostname.
                         rustls::client::verify_server_name(
-                            &rustls::server::ParsedCertificate::try_from(end_entity)?,
-                            server_name,
+                            &rustls::server::ParsedCertificate::try_from(&certificates.end_entity)?,
+                            identity.server_name,
                         )
                     }
                     VerifierStatus::Unavailable => Err(TlsError::General(String::from(
@@ -226,7 +230,7 @@ impl Verifier {
                         Err(InvalidCertificate(CertificateError::BadEncoding))
                     }
                     VerifierStatus::InvalidExtension => Err(InvalidCertificate(
-                        CertificateError::Other(OtherError(std::sync::Arc::new(super::EkuError))),
+                        CertificateError::Other(OtherError::new(super::EkuError)),
                     )),
                 }
             }
@@ -272,25 +276,20 @@ fn extract_result_info(env: &mut Env<'_>, result: JObject<'_>) -> (VerifierStatu
 }
 
 #[cfg_attr(docsrs, doc(cfg(all())))]
-impl ServerCertVerifier for Verifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &pki_types::CertificateDer<'_>,
-        intermediates: &[pki_types::CertificateDer<'_>],
-        server_name: &pki_types::ServerName,
-        ocsp_response: &[u8],
-        now: pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, TlsError> {
-        log_server_cert(end_entity);
-
-        let ocsp_data = if !ocsp_response.is_empty() {
-            Some(ocsp_response)
-        } else {
-            None
+impl ServerVerifier for Verifier {
+    fn verify_identity(&self, identity: &ServerIdentity<'_>) -> Result<PeerVerified, TlsError> {
+        let Identity::X509(certificates) = identity.identity else {
+            return Err(InvalidCertificate(CertificateError::Other(
+                OtherError::new(std::io::Error::other(
+                    "platform verifier only supports X.509 certificates",
+                )),
+            )));
         };
 
-        match self.verify_certificate(end_entity, intermediates, server_name, ocsp_data, now) {
-            Ok(()) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+        log_server_cert(&certificates.end_entity);
+
+        match self.verify_certificate(certificates, identity) {
+            Ok(()) => Ok(PeerVerified::assertion()),
             Err(e) => {
                 // This error only tells us what the system errored with, so it doesn't leak anything
                 // sensitive.
@@ -302,28 +301,20 @@ impl ServerCertVerifier for Verifier {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &pki_types::CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, TlsError> {
         verify_tls12_signature(
-            message,
-            cert,
-            dss,
+            input,
             &self.crypto_provider.signature_verification_algorithms,
         )
     }
 
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &pki_types::CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, TlsError> {
         verify_tls13_signature(
-            message,
-            cert,
-            dss,
+            input,
             &self.crypto_provider.signature_verification_algorithms,
         )
     }
@@ -332,5 +323,15 @@ impl ServerCertVerifier for Verifier {
         self.crypto_provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+
+    fn request_ocsp_response(&self) -> bool {
+        true
+    }
+
+    fn hash_config(&self, h: &mut dyn Hasher) {
+        h.write(b"rustls-platform-verifier-android");
+        #[cfg(any(test, feature = "ffi-testing"))]
+        h.write_u8(u8::from(self.test_only_root_ca_override.is_some()));
     }
 }
