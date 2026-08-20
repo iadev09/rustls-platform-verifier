@@ -7,9 +7,10 @@ mod verification_real_world;
 
 mod verification_mock;
 
+use rustls::crypto::CryptoProvider;
+use rustls::error::CertificateError;
 use rustls::{
-    crypto::CryptoProvider,
-    pki_types, CertificateError,
+    pki_types,
     Error::{self as TlsError, InvalidCertificate},
 };
 
@@ -46,8 +47,8 @@ pub fn assert_cert_error_eq<E: StdError + PartialEq + 'static>(
     if let Err(InvalidCertificate(CertificateError::Other(err))) = &expected {
         let expected_err = expected_err.expect("error not provided for `Other` case handling");
         let err: &E = err
-            .0
-            .downcast_ref()
+            .source()
+            .and_then(|source| source.downcast_ref())
             .expect("incorrect `Other` inner error kind");
         assert_eq!(err, expected_err);
     } else {
@@ -56,5 +57,5 @@ pub fn assert_cert_error_eq<E: StdError + PartialEq + 'static>(
 }
 
 fn test_provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    Arc::new(rustls_ring::DEFAULT_PROVIDER.clone())
 }
